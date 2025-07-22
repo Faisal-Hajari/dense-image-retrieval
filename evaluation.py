@@ -1,4 +1,4 @@
-from models.retrivals import OpenCLIPRetrival
+from models.retrivals import OpenCLIPRetrival, InvAttenRetrival
 from torchvision.datasets import CocoCaptions
 import pandas as pd 
 import numpy as np
@@ -99,6 +99,7 @@ def recall(retrival:OpenCLIPRetrival)->None:
     return similarity_df, recall_results, i2t_recall_results
 
 if __name__ == "__main__":
+    print("#### SigLIP ####")
     retrival = OpenCLIPRetrival(
         model_name="ViT-SO400M-14-SigLIP-384",
         dataset="webli",
@@ -106,5 +107,8 @@ if __name__ == "__main__":
         batch_size=128
     )
     similarity_df, recall_results, i2t_recall_results = recall(retrival)
-    print(recall_results)
-    print(i2t_recall_results)
+    
+    print("#### InvAtten ####")
+    retrival = InvAttenRetrival()
+    similarity_df, recall_results, i2t_recall_results = recall(retrival)
+    print("#### Done ####")
