@@ -9,6 +9,8 @@ import math
 import cv2 
 from torch.nn import functional as F
 from sklearn.cluster import KMeans
+from transformers import AutoModel
+from transformers import CLIPProcessor, CLIPModel
 
 class TextImageRetrieval:
     def index_images(self, image_paths:list[str])->None: 
@@ -18,7 +20,7 @@ class TextImageRetrieval:
         pass        
 
 class OpenCLIPRetrival(TextImageRetrieval):
-    def __init__(self, model_name:str, dataset:str=None, device:str="cuda", batch_size:int=128):
+    def __init__(self, model_name:str, dataset:str=None, device:str="cuda", batch_size:int=128, prompt:str="") :
         self.device = device
         if dataset is None:
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, device=device)
@@ -29,7 +31,7 @@ class OpenCLIPRetrival(TextImageRetrieval):
         self.batch_size = batch_size
         self.images = {"data_index":[], "image":[], "embedding":[]}
         self.texts = {"data_index":[], "text":[], "embedding":[]}
-        
+        self.prompt = prompt
         
     def index_coco_dataset(self, coco_dataset)->None:
         # we build the meta data first 
@@ -67,7 +69,7 @@ class OpenCLIPRetrival(TextImageRetrieval):
         embeddings = [] 
         for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
             batch = texts[i:i+batch_size]
-            inputs = self.tokenizer(batch).to(self.device)
+            inputs = self.tokenizer([self.prompt + text for text in batch]).to(self.device)
             text_features = self.model.encode_text(inputs)
             embeddings.append(text_features.cpu())
         return torch.cat(embeddings, dim=0)
@@ -79,7 +81,7 @@ class InvAttenRetrival(TextImageRetrieval):
                 kernel_size: tuple = (64,64),
                 threshold: float = 0.4,
                 stride: tuple = (16, 16),
-                n_crops: int = 10, 
+                n_crops: int = 5, 
                 include_full_image: bool = True):
         
         self.n_crops = n_crops
@@ -122,10 +124,10 @@ class InvAttenRetrival(TextImageRetrieval):
         embeddings = [] 
         for image in tqdm(images, desc="Embedding images"):             
             image_features = self.forward_images(image)
-            embeddings.append(image_features.cpu())
-        return torch.cat(embeddings, dim=0) # [len(images), embedding dim]
+            embeddings.append(image_features.cpu().unsqueeze(0)) # [1, n_crops+1, embedding dim]
+        return torch.cat(embeddings, dim=0) # [len(images), (n_crops+1), embedding dim]
     
-    
+    #thsi takes an image PIL adn returns a tensor of shape [n_crops+1, embedding dim]
     def embed_image(self, image): 
         image_features = self.forward_images(image)
         return image_features.cpu()
@@ -163,6 +165,10 @@ class InvAttenRetrival(TextImageRetrieval):
 
         boxes = np.array(boxes, dtype=int)
 
+        # Check if no boxes found - fallback to full image only
+        if len(boxes) == 0:
+            return full_feature  # [1, embedding_dim]
+        
         if self.n_crops < len(boxes):
             k_means = KMeans(n_clusters=self.n_crops)
             k_means.fit(boxes)
@@ -180,7 +186,7 @@ class InvAttenRetrival(TextImageRetrieval):
             merged_boxes = np.array(merged_boxes)
         else: 
             merged_boxes = boxes
-            
+
         crops = []
         for box in merged_boxes:
             xmin, ymin, xmax, ymax = box
@@ -190,8 +196,12 @@ class InvAttenRetrival(TextImageRetrieval):
         crops = [self.preprocess(crop) for crop in crops]
         crops = torch.stack(crops).to(self.device)  # [batch_size, 3, H, W]
         image_features = self.clip.encode_image(crops)
-        all_features = torch.cat([full_feature, image_features], dim=0)
-        return all_features # [n_crops+1, embedding dim]
+        
+        if self.include_full_image:
+            all_features = torch.cat([full_feature, image_features], dim=0)
+            return all_features # [n_crops+1, embedding dim]
+        else:
+            return image_features  # [n_crops, embedding dim]
     
     def sliding_windows(self, mask, k, thresh, stride=None):
         h,w = mask.shape
@@ -280,6 +290,138 @@ class InvAttenRetrival(TextImageRetrieval):
             inputs = self.tokenizer(batch).to(self.device)
             text_features = self.clip.encode_text(inputs)
             embeddings.append(text_features.cpu())
+        return torch.cat(embeddings, dim=0) # [len(texts), embedding dim]
+
+
+class ClipHuggingFaceRetrival(TextImageRetrieval):
+    def __init__(self, model_name:str="openai/clip-vit-large-patch14", device:str="cuda", batch_size:int=128, prompt:str="", truncate_dim=None):
+        self.device = device
+        self.model = CLIPModel.from_pretrained(model_name)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model.to(device)
+        self.model.eval()
+        
+        self.batch_size = batch_size
+        self.images = {"data_index":[], "image":[], "embedding":[]}
+        self.texts = {"data_index":[], "text":[], "embedding":[]}
+        self.prompt = prompt
+        self.truncate_dim = truncate_dim
+        
+    def index_coco_dataset(self, coco_dataset)->None:
+        # we build the meta data first 
+        for idx, (image, texts) in tqdm(enumerate(coco_dataset), desc="building tables"):
+            self.images["data_index"].append(idx)
+            self.images["image"].append(image)    
+            for txt in texts: 
+                self.texts["data_index"].append(idx)
+                self.texts["text"].append(txt)
+        
+        # we build the embedding here so we can take advantage of batching 
+        image_embeddings = self.embed_images(self.images["image"], self.batch_size)
+        text_embeddings = self.embed_texts(self.texts["text"], self.batch_size)
+        
+        image_embeddings_list = [emb.numpy() for emb in image_embeddings]
+        text_embeddings_list = [emb.numpy() for emb in text_embeddings]
+        
+        # we store the embeddings in the meta data 
+        self.images["embedding"] = image_embeddings_list
+        self.texts["embedding"] = text_embeddings_list
+        
+    @torch.no_grad()
+    def embed_images(self, images:list[Image], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(images), batch_size), desc="Embedding images"):
+            batch = images[i:i+batch_size]
+            
+            # Process images using HuggingFace processor
+            inputs = self.processor(images=batch, return_tensors="pt", padding=False)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Get image features
+            image_features = self.model.get_image_features(**inputs)
+            
+            # Apply truncation if specified
+            if self.truncate_dim is not None:
+                image_features = image_features[:, :self.truncate_dim]
+                
+            # Normalize features (following CLIP convention)
+            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+            
+            embeddings.append(image_features.cpu())
         return torch.cat(embeddings, dim=0)
+    
+    @torch.no_grad()
+    def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
+            batch = texts[i:i+batch_size]
+            
+            # Add prompt if specified
+            if self.prompt:
+                batch = [self.prompt + text for text in batch]
+            
+            # Process texts using HuggingFace processor
+            inputs = self.processor(text=batch, return_tensors="pt", padding=True, truncation=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Get text features
+            text_features = self.model.get_text_features(**inputs)
+            
+            # Apply truncation if specified
+            if self.truncate_dim is not None:
+                text_features = text_features[:, :self.truncate_dim]
+                
+            # Normalize features (following CLIP convention)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+            
+            embeddings.append(text_features.cpu())
+        return torch.cat(embeddings, dim=0)
+
+
+class JinaRetrival(TextImageRetrieval):
+    def __init__(self, device:str="cuda", batch_size:int=128, prompt:str="", truncate_dim = None) :
+        self.device = device
+
+        self.model = AutoModel.from_pretrained('jinaai/jina-clip-v2', trust_remote_code=True)
+        self.model.to(device)
+        self.model.eval()
+        self.truncate_dim = truncate_dim        
+        self.batch_size = batch_size
+        self.images = {"data_index":[], "image":[], "embedding":[]}
+        self.texts = {"data_index":[], "text":[], "embedding":[]}
+        self.prompt = prompt
+    
+    
+    def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
+            batch = texts[i:i+batch_size]
+            embeddings.append(self.model.encode_text(batch, task='retrieval.query', truncate_dim=self.truncate_dim))
+        return torch.cat(embeddings, dim=0)
+
+    def embed_images(self, images:list[Image], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(images), batch_size), desc="Embedding images"):
+            batch = images[i:i+batch_size]
+            embeddings.append(self.model.encode_image(batch, truncate_dim=self.truncate_dim))
+        return torch.cat(embeddings, dim=0)
+    
+    def index_coco_dataset(self, coco_dataset)->None:
+        # we build the meta data first 
+        for idx, (image, texts) in tqdm(enumerate(coco_dataset), desc="building tables"):
+            self.images["data_index"].append(idx)
+            self.images["image"].append(image)    
+            for txt in texts: 
+                self.texts["data_index"].append(idx)
+                self.texts["text"].append(txt)
         
+        # we build the embedding here so we can take advantage of batching 
+        image_embeddings = self.embed_images(self.images["image"], self.batch_size)
+        text_embeddings = self.embed_texts(self.texts["text"], self.batch_size)
         
+        image_embeddings_list = [emb.numpy() for emb in image_embeddings]
+        text_embeddings_list = [emb.numpy() for emb in text_embeddings]
+        
+        # we store the embeddings in the meta data 
+        self.images["embedding"] = image_embeddings_list
+        self.texts["embedding"] = text_embeddings_list
