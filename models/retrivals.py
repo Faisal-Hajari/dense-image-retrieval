@@ -131,7 +131,21 @@ class InvAttenRetrival(TextImageRetrieval):
     def embed_image(self, image): 
         image_features = self.forward_images(image)
         return image_features.cpu()
+    
+    
         
+    @torch.no_grad()
+    def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
+            batch = texts[i:i+batch_size]
+            inputs = self.tokenizer(batch).to(self.device)
+            text_features = self.clip.encode_text(inputs)
+            embeddings.append(text_features.cpu())
+        return torch.cat(embeddings, dim=0) # [len(texts), embedding dim]
+    
+    
+    # Ignore theses :: 
     @torch.no_grad()
     def forward_images(self, image:Image) -> torch.Tensor:
         # save original size
@@ -281,16 +295,7 @@ class InvAttenRetrival(TextImageRetrieval):
         attn = (q_scaled @ k.transpose(-2, -1)).softmax(dim=-1)
 
         return pooled, attn  # attn: [B, heads, queries, seq_len]
-    
-    @torch.no_grad()
-    def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
-        embeddings = [] 
-        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
-            batch = texts[i:i+batch_size]
-            inputs = self.tokenizer(batch).to(self.device)
-            text_features = self.clip.encode_text(inputs)
-            embeddings.append(text_features.cpu())
-        return torch.cat(embeddings, dim=0) # [len(texts), embedding dim]
+
 
 
 class ClipHuggingFaceRetrival(TextImageRetrieval):
