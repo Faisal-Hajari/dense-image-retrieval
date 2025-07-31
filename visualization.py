@@ -7,10 +7,12 @@ from PIL import Image, ImageDraw, ImageFont
 import torch
 from typing import Tuple, List
 import math
+import textwrap
+from sklearn.metrics.pairwise import cosine_similarity
 
 def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir: str, image_name: str):
     """
-    Visualize the complete attention-based retrieval process and save all intermediate steps.
+    Visualize the complete attention-based retrieval process and save selected outputs.
     
     Args:
         retrieval_model: InvAttenRetrival instance
@@ -22,7 +24,7 @@ def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir:
     
     # Save original image
     orig_W, orig_H = image.size
-    image.save(os.path.join(save_dir, f"{image_name}_1_original.jpg"))
+    image.save(os.path.join(save_dir, "original.jpg"))
     
     # Preprocess to 384×384
     x = retrieval_model.preprocess(image).unsqueeze(0).to(retrieval_model.device)
@@ -35,12 +37,6 @@ def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir:
     
     # Build mask at 384×384
     mask = retrieval_model.create_mask(attn_np, 384, 384, retrieval_model.threshold)
-    
-    # Create and save heatmap visualization
-    create_heatmap_overlay(image, attn_np, save_dir, f"{image_name}_2_heatmap")
-    
-    # Create and save binary mask overlay
-    create_binary_mask_overlay(image, mask, save_dir, f"{image_name}_2b_binary_mask")
     
     # Sliding window in 384×384 coords
     boxes384 = retrieval_model.sliding_windows(mask, retrieval_model.kernel_size, retrieval_model.threshold, retrieval_model.stride)
@@ -59,9 +55,6 @@ def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir:
         ))
     
     boxes = np.array(boxes, dtype=int)
-    
-    # Save boxes before KMeans
-    draw_boxes_on_image_clean(image, boxes, save_dir, f"{image_name}_3_boxes_before_kmeans")
     
     # Apply KMeans clustering if needed
     if len(boxes) == 0:
@@ -93,10 +86,10 @@ def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir:
     else:
         merged_boxes = boxes
     
-    # Save boxes after KMeans
-    draw_boxes_on_image_clean(image, merged_boxes, save_dir, f"{image_name}_4_boxes_after_kmeans")
+    # Save boxes after KMeans (final merged boxes)
+    draw_boxes_on_image_clean(image, merged_boxes, save_dir, "boxes_after_kmeans")
     
-    # Extract and save crops
+    # Extract crops
     crops = []
     for i, box in enumerate(merged_boxes):
         xmin, ymin, xmax, ymax = box
@@ -104,13 +97,11 @@ def visualize_attention_retrieval(retrieval_model, image: Image.Image, save_dir:
             continue
         cropped_image = image.crop((xmin, ymin, xmax, ymax))
         crops.append(cropped_image)
-        # Save individual crop
-        cropped_image.save(os.path.join(save_dir, f"{image_name}_5_crop_{i:02d}.jpg"))
     
-    # Create crops grid visualization
-    create_crops_grid_clean(image, crops, merged_boxes, save_dir, f"{image_name}_5_all_crops")
+    # Create and save crops grid visualization
+    create_crops_grid_clean(image, crops, merged_boxes, save_dir, "all_crops")
     
-    print(f"Saved visualizations to {save_dir}: original, heatmap, binary mask, {len(boxes)} boxes before clustering, {len(merged_boxes)} boxes after clustering, and {len(crops)} crops")
+    print(f"Saved visualizations to {save_dir}: original.jpg, boxes_after_kmeans.jpg, all_crops.jpg")
     return crops
 
 def create_heatmap_overlay(image: Image.Image, attn_np: np.ndarray, save_dir: str, filename: str):
@@ -174,7 +165,7 @@ def draw_boxes_on_image_clean(image: Image.Image, boxes: np.ndarray, save_dir: s
             width = xmax - xmin
             height = ymax - ymin
             rect = patches.Rectangle((xmin, ymin), width, height, 
-                                   linewidth=2, edgecolor=color, facecolor='none', alpha=0.8)
+                                   linewidth=5, edgecolor=color, facecolor='none', alpha=0.8)
             ax.add_patch(rect)
     
     ax.axis('off')
@@ -230,6 +221,122 @@ def create_crops_grid_clean(original_image: Image.Image, crops: List[Image.Image
     plt.savefig(os.path.join(save_dir, f"{filename}.jpg"), dpi=150, bbox_inches='tight', pad_inches=0)
     plt.close()
 
+def create_similarity_bar_chart(retrieval_model, image: Image.Image, text_queries: List[str], 
+                               save_dir: str, filename: str):
+    """
+    Create a bar chart comparing full image vs best crop similarity for multiple text queries.
+    
+    Args:
+        retrieval_model: InvAttenRetrival instance (must have both full image and crops)
+        image: PIL Image to process
+        text_queries: List of text strings to compare against
+        save_dir: Directory to save the chart
+        filename: Name for the saved file (without extension)
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Get image embeddings (includes full image + crops)
+    with torch.no_grad():
+        image_features = retrieval_model.embed_image(image)  # Shape: [n_crops+1, embedding_dim] or [n_crops, embedding_dim]
+        
+        # Get text embeddings
+        text_embeddings = retrieval_model.embed_texts(text_queries, batch_size=len(text_queries))
+    
+    # Convert to numpy for cosine similarity calculation
+    image_features_np = image_features.numpy()
+    text_embeddings_np = text_embeddings.numpy()
+    
+    # Calculate similarities
+    similarity_matrix = cosine_similarity(text_embeddings_np, image_features_np)  # [n_texts, n_image_features]
+    
+    # Extract similarities
+    if retrieval_model.include_full_image:
+        # First feature is full image, rest are crops
+        full_image_similarities = similarity_matrix[:, 0]  # [n_texts]
+        crop_similarities = similarity_matrix[:, :]  # [n_texts, n_crops]
+        # Get maximum similarity across all features (full image + crops)
+        max_all_similarities = np.max(similarity_matrix, axis=1)  # [n_texts]
+    else:
+        # All features are crops, need to compute full image separately
+        with torch.no_grad():
+            # Get full image embedding
+            x = retrieval_model.preprocess(image).unsqueeze(0).to(retrieval_model.device)
+            tokens, _ = retrieval_model.clip.visual.trunk.forward_intermediates(x)
+            full_feature, _ = retrieval_model.wrap_attn_pool(retrieval_model.clip.visual.trunk.attn_pool, tokens)
+            full_image_features_np = full_feature.cpu().numpy()
+        
+        full_image_similarities = cosine_similarity(text_embeddings_np, full_image_features_np)[:, 0]
+        max_all_similarities = np.max(similarity_matrix, axis=1)  # Max across crops only
+    
+    # Create bar chart
+    fig, ax = plt.subplots(figsize=(max(8, len(text_queries) * 1.5), 7))
+    
+    x_pos = np.arange(len(text_queries))
+    width = 0.35
+    
+    # Create bars
+    bars1 = ax.bar(x_pos - width/2, full_image_similarities, width, 
+                   label='SigLIP Similarity', alpha=0.8, color='skyblue')
+    bars2 = ax.bar(x_pos + width/2, max_all_similarities, width,
+                   label='Ours Similarity', alpha=0.8, color='lightcoral')
+    
+    # Customize chart
+    ax.set_xlabel('Text Queries', fontsize=12)
+    ax.set_ylabel('Cosine Similarity', fontsize=12)
+    ax.set_title('Text-Image Similarity: SigLIP vs Ours', fontsize=14, fontweight='bold')
+    ax.set_xticks(x_pos)
+    
+    # Handle long text queries with multi-line wrapping
+    wrapped_queries = []
+    for query in text_queries:
+        if len(query) > 20:  # Wrap if longer than 20 characters
+            wrapped = textwrap.fill(query, width=20)
+            wrapped_queries.append(wrapped)
+        else:
+            wrapped_queries.append(query)
+    
+    ax.set_xticklabels(wrapped_queries, fontsize=14, ha='center')
+    
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    def add_value_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),  # 3 points vertical offset
+                       textcoords="offset points",
+                       ha='center', va='bottom', fontsize=9)
+    
+    add_value_labels(bars1)
+    add_value_labels(bars2)
+    
+    # Set y-axis limits to fixed range
+    ax.set_ylim(-0.1, 0.15)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{filename}.jpg"), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Print results for debugging
+    print(f"\nSimilarity Results for {len(text_queries)} queries:")
+    print("-" * 50)
+    for i, query in enumerate(text_queries):
+        print(f"Query: '{query[:50]}{'...' if len(query) > 50 else ''}'")
+        print(f"  SigLIP Similarity: {full_image_similarities[i]:.4f}")
+        print(f"  Ours Similarity: {max_all_similarities[i]:.4f}")
+        improvement = max_all_similarities[i] - full_image_similarities[i]
+        print(f"  Improvement: {improvement:+.4f}")
+        print()
+    
+    return {
+        'full_image_similarities': full_image_similarities,
+        'max_all_similarities': max_all_similarities,
+        'text_queries': text_queries
+    }
+
 # Example usage function
 def test_visualization():
     """Test the visualization with a sample image."""
@@ -243,17 +350,49 @@ def test_visualization():
         include_full_image=True, 
     )
     
-    # Load a sample image (replace with your path)
+    # # Load a sample image (replace with your path)
     coco_root = "data/val2017"
     coco_ann_file = "annotations/captions_val2017.json"
     dataset = CocoCaptions(root=coco_root, annFile=coco_ann_file)
+
     
-    # Get first image
-    image, captions = dataset[4444]
-    # image = Image.open("image.png").convert("RGB")  # Replace with actual image path if needed
-    # Create visualization
-    save_dir = "visualizations"
-    visualize_attention_retrieval(retrieval_model, image, save_dir, "sample_image_001")
+    #image_0
+    image = Image.open(
+        "tests/Screenshot 1447-01-13 at 7.20.54 PM.png"
+        ).convert("RGB")  # Replace with actual image path if needed
+    save_dir = "image_0"
+ 
+    
+    #image_1
+    # image = Image.open(
+    #     "tt/Images/Picture14-Enhanced.jpg"
+    #     ).convert("RGB")  # Replace with actual image path if needed
+    # save_dir = "image_1"
+    
+    
+    #image_2
+    # image, captions = dataset[4444]
+    # save_dir = "image_2"
+    
+    visualize_attention_retrieval(retrieval_model, image, save_dir, "014")
+    
+    # Example text queries for similarity comparison
+    text_queries = [
+        "a man holding a bag over his shoulder", 
+        "a group of women wearing a blue headscarf",
+        "a parked truck",
+    ]
+    
+    # Create similarity bar chart
+    similarity_results = create_similarity_bar_chart(
+        retrieval_model, 
+        image, 
+        text_queries, 
+        save_dir, 
+        "similarity_comparison"
+    )
+    
+    print(f"Saved all visualizations to {save_dir}: original.jpg, boxes_after_kmeans.jpg, all_crops.jpg, similarity_comparison.jpg")
 
 if __name__ == "__main__":
     test_visualization()

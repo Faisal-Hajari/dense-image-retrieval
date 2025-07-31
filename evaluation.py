@@ -1,9 +1,39 @@
-from models.retrivals import OpenCLIPRetrival, InvAttenRetrival
+from models.retrivals import OpenCLIPRetrival, InvAttenRetrival, ClipHuggingFaceRetrival
 from torchvision.datasets import CocoCaptions
 import pandas as pd 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import os
+import json
+from datasets import load_dataset
+import requests
+from PIL import Image
+from io import BytesIO
 
+
+# def load_image_from_url(url):
+#     response = requests.get(url)
+#     response.raise_for_status()  # Raises an HTTPError for bad responses
+#     image = Image.open(BytesIO(response.content))
+#     return image
+
+
+# class Kerpaty_cococ: 
+#     def __init__(self, images_path:str):
+#         self.images_path = images_path
+#         self.dataset = load_dataset("yerevann/coco-karpathy", split="test")
+#         self.root = self.images_path
+        
+        
+#     def __getitem__(self, idx):
+#         image_path = os.path.join(
+#             self.images_path, 
+#             self.dataset[idx]['filename'].split("_")[-1]
+#         )
+#         # image = load_image_from_url(self.dataset[idx]['url'])
+#         image = Image.open(image_path)
+#         captions = self.dataset[idx]['sentences']
+#         return image, [captions[0]]
 
 #Dataset
 coco_root = "data/val2017"
@@ -12,6 +42,9 @@ dataset = CocoCaptions(
     root=coco_root,
     annFile=coco_ann_file,
 )
+
+
+# dataset = Kerpaty_cococ(images_path="coco_test_images")
 
 
 def calculate_recall_at_k_from_table(similarity_df, k_vals):
@@ -64,10 +97,25 @@ def calculate_image_to_text_recall_at_k(similarity_df, k_vals):
     
     return results
 
-def recall(retrival:OpenCLIPRetrival)->None:
+def recall(retrival: OpenCLIPRetrival, save_path: str = None) -> tuple:
     retrival.index_coco_dataset(dataset)
     images = pd.DataFrame(retrival.images)
     texts = pd.DataFrame(retrival.texts)  
+    
+    # # Convert PIL Images to file paths before saving
+    # if save_path is not None:
+    #     images_for_saving = images.copy()
+    #     # Extract image paths from the dataset
+    #     image_paths = []
+    #     for idx in images['data_index']:
+    #         # Get the image path from the COCO dataset
+    #         img_info = dataset.coco.loadImgs(dataset.ids[idx])[0]
+    #         img_path = os.path.join(dataset.root, img_info['file_name'])
+    #         image_paths.append(img_path)
+        
+    #     images_for_saving['image_path'] = image_paths
+    #     images_for_saving = images_for_saving.drop('image', axis=1)  # Remove PIL Image column
+    
     image_embeddings = np.stack(images['embedding'].values)  # Shape: [1000, 1152]
     text_embeddings = np.stack(texts['embedding'].values)    # Shape: [5000, 1152]
 
@@ -96,19 +144,70 @@ def recall(retrival:OpenCLIPRetrival)->None:
     })
     recall_results = calculate_recall_at_k_from_table(similarity_df, k_vals=[1, 5, 10])
     i2t_recall_results = calculate_image_to_text_recall_at_k(similarity_df, k_vals=[1, 5, 10])
+    
+    # Save results if save_path is provided
+    if save_path is not None: 
+        images_for_saving = images.copy()
+        images_for_saving = images_for_saving.drop('image', axis=1)  # Remove PIL Image column
+        # Create directory if it doesn't exist
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save similarity DataFrame as parquet (more efficient than CSV for large data)
+        similarity_df.to_parquet(os.path.join(save_path, "similarity_matrix.parquet"), index=False)
+        
+        # Save images and texts metadata (with image paths instead of PIL Images)
+        images_for_saving.to_parquet(os.path.join(save_path, "images_metadata.parquet"), index=False)
+        texts.to_parquet(os.path.join(save_path, "texts_metadata.parquet"), index=False)
+        
+        # Save recall results as JSON
+        combined_results = {
+            "text_to_image_recall": recall_results,
+            "image_to_text_recall": i2t_recall_results,
+            "dataset_stats": {
+                "n_images": n_images,
+                "n_texts": n_texts,
+                "total_similarity_pairs": len(similarity_df)
+            }
+        }
+        
+        with open(os.path.join(save_path, "recall_results.json"), 'w') as f:
+            json.dump(combined_results, f, indent=2)
+        
+        print(f"Results saved to: {save_path}")
+        print(f"- similarity_matrix.parquet: {len(similarity_df):,} rows")
+        print(f"- images_metadata.parquet: {len(images_for_saving):,} rows (with image paths)") 
+        print(f"- texts_metadata.parquet: {len(texts):,} rows")
+        print(f"- recall_results.json: T2I and I2T metrics")
+    
     return similarity_df, recall_results, i2t_recall_results
 
 if __name__ == "__main__":
-    print("#### SigLIP ####")
-    retrival = OpenCLIPRetrival(
-        model_name="ViT-SO400M-14-SigLIP-384",
-        dataset="webli",
+    # print("#### SigLIP ####")
+    # retrival = OpenCLIPRetrival(
+    #     model_name="ViT-SO400M-14-SigLIP-384",
+    #     dataset="webli",
+    #     device="cuda",
+    #     batch_size=128
+    # )
+    # similarity_df, recall_results, i2t_recall_results = recall(retrival, save_path="results/siglip")
+    print("#### CLIP ####")
+    # retrival = OpenCLIPRetrival(
+    #     model_name="ViT-L-14-336",
+    #     dataset="openai",
+    #     device="cuda",
+    #     batch_size=128,
+    #     # prompt="A photo of a "
+    # )
+    retrival = ClipHuggingFaceRetrival(
+        model_name="openai/clip-vit-large-patch14",
         device="cuda",
-        batch_size=128
+        batch_size=128,
+        prompt="A photo of "
     )
-    similarity_df, recall_results, i2t_recall_results = recall(retrival)
+    similarity_df, recall_results, i2t_recall_results = recall(retrival, save_path="CLIP_eval_results") 
+    # print("#### JINA ####")
     
-    print("#### InvAtten ####")
-    retrival = InvAttenRetrival()
-    similarity_df, recall_results, i2t_recall_results = recall(retrival)
+    # print("#### InvAtten ####")
+    # retrival = InvAttenRetrival()
+    # similarity_df, recall_results, i2t_recall_results = recall(retrival, save_path="results/inv_atten")
     print("#### Done ####")

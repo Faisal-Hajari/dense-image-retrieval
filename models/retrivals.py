@@ -339,7 +339,7 @@ class ClipHuggingFaceRetrival(TextImageRetrieval):
             batch = images[i:i+batch_size]
             
             # Process images using HuggingFace processor
-            inputs = self.processor(images=batch, return_tensors="pt", padding=False)
+            inputs = self.processor(images=batch, return_tensors="pt", use_fast=True)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
             # Get image features
@@ -401,14 +401,20 @@ class JinaRetrival(TextImageRetrieval):
         embeddings = [] 
         for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
             batch = texts[i:i+batch_size]
-            embeddings.append(self.model.encode_text(batch, task='retrieval.query', truncate_dim=self.truncate_dim))
+            embeddings.append(
+                torch.from_numpy(self.model.encode_text(batch, task='retrieval.query', truncate_dim=self.truncate_dim)
+                ))
         return torch.cat(embeddings, dim=0)
 
     def embed_images(self, images:list[Image], batch_size:int=128)->torch.Tensor:
         embeddings = [] 
         for i in tqdm(range(0, len(images), batch_size), desc="Embedding images"):
             batch = images[i:i+batch_size]
-            embeddings.append(self.model.encode_image(batch, truncate_dim=self.truncate_dim))
+            embeddings.append(
+                torch.from_numpy(self.model.encode_image(
+                    batch, truncate_dim=self.truncate_dim)
+                                )
+                              )
         return torch.cat(embeddings, dim=0)
     
     def index_coco_dataset(self, coco_dataset)->None:
