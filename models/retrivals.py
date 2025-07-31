@@ -124,7 +124,7 @@ class InvAttenRetrival(TextImageRetrieval):
         embeddings = [] 
         for image in tqdm(images, desc="Embedding images"):             
             image_features = self.forward_images(image)
-            embeddings.append(image_features.cpu().unsqueeze(0)) # [1, n_crops+1, embedding dim]
+            embeddings.append(image_features.cpu()) # [1, n_crops+1, embedding dim]
         return torch.cat(embeddings, dim=0) # [len(images), (n_crops+1), embedding dim]
     
     #thsi takes an image PIL adn returns a tensor of shape [n_crops+1, embedding dim]
@@ -132,8 +132,6 @@ class InvAttenRetrival(TextImageRetrieval):
         image_features = self.forward_images(image)
         return image_features.cpu()
     
-    
-        
     @torch.no_grad()
     def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
         embeddings = [] 
@@ -144,8 +142,6 @@ class InvAttenRetrival(TextImageRetrieval):
             embeddings.append(text_features.cpu())
         return torch.cat(embeddings, dim=0) # [len(texts), embedding dim]
     
-    
-    # Ignore theses :: 
     @torch.no_grad()
     def forward_images(self, image:Image) -> torch.Tensor:
         # save original size
@@ -210,12 +206,12 @@ class InvAttenRetrival(TextImageRetrieval):
         crops = [self.preprocess(crop) for crop in crops]
         crops = torch.stack(crops).to(self.device)  # [batch_size, 3, H, W]
         image_features = self.clip.encode_image(crops)
-        
         if self.include_full_image:
             all_features = torch.cat([full_feature, image_features], dim=0)
             return all_features # [n_crops+1, embedding dim]
         else:
             return image_features  # [n_crops, embedding dim]
+    
     
     def sliding_windows(self, mask, k, thresh, stride=None):
         h,w = mask.shape
@@ -296,7 +292,93 @@ class InvAttenRetrival(TextImageRetrieval):
 
         return pooled, attn  # attn: [B, heads, queries, seq_len]
 
+class GridCroppingRetrival(TextImageRetrieval):
+    def __init__(self, device, n_crops:int=5): 
+        self.device = device
+        self.clip, _, self.preprocess = open_clip.create_model_and_transforms("ViT-SO400M-14-SigLIP-384", pretrained="webli", device=device)
+        self.images = {"data_index":[], "image":[], "embedding":[]}
+        self.texts = {"data_index":[], "text":[], "embedding":[]} 
+        self.n_crops = n_crops
+        
+    def index_coco_dataset(self, coco_dataset: CocoCaptions) -> None:
+        # embedding_per_image = self.n_crops + 1 if self.include_full_image else self.n_crops
+        for idx, (image, texts) in tqdm(enumerate(coco_dataset), desc="embedding images"):
+            image_embeddings = self.embed_image(image)
+            for embedding in image_embeddings:
+                self.images["data_index"].append(idx)
+                self.images["image"].append(image)
+                self.images["embedding"].append(embedding.numpy())
+            for txt in texts: 
+                self.texts["data_index"].append(idx)
+                self.texts["text"].append(txt)
+        
+        # we build the embedding here so we can take advantage of batching 
+        text_embeddings = self.embed_texts(self.texts["text"], self.batch_size)
+        
+        text_embeddings_list = [emb.numpy() for emb in text_embeddings]
+        
+        # we store the embeddings in the meta data 
+        self.texts["embedding"] = text_embeddings_list 
+        
+        
+    @torch.no_grad()
+    def embed_images(self, images: list[Image], batch_size: int = 128) -> torch.Tensor:
+        embeddings = [] 
+        for image in tqdm(images, desc="Embedding images"):             
+            image_features = self.forward_images(image)
+            embeddings.append(image_features.cpu()) # [1, n_crops+1, embedding dim]
+        return torch.cat(embeddings, dim=0) # [len(images), (n_crops+1), embedding dim]
+    
+    #thsi takes an image PIL adn returns a tensor of shape [n_crops+1, embedding dim]
+    def embed_image(self, image): 
+        image_features = self.forward_images(image)
+        return image_features.cpu()
+    
+    @torch.no_grad()
+    def embed_texts(self, texts:list[str], batch_size:int=128)->torch.Tensor:
+        embeddings = [] 
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
+            batch = texts[i:i+batch_size]
+            inputs = self.tokenizer(batch).to(self.device)
+            text_features = self.clip.encode_text(inputs)
+            embeddings.append(text_features.cpu())
+        return torch.cat(embeddings, dim=0) # [len(texts), embedding dim] 
 
+    
+    def crop_image(self, image:Image, num_crops:int) -> list[Image]: 
+        width, height = image.size
+        crops = []
+        grid_size = math.ceil(math.sqrt(num_crops))
+        rows = grid_size
+        cols = math.ceil(num_crops / rows)
+        crop_width = width // cols
+        crop_height = height // rows        
+        crop_count = 0
+        for i in range(rows):
+            for j in range(cols):
+                if crop_count >= num_crops:
+                    break
+                
+                left = j * crop_width
+                upper = i * crop_height
+                right = left + crop_width
+                lower = upper + crop_height
+                
+                crop = image.crop((left, upper, right, lower))
+                crops.append(crop)
+                crop_count += 1
+        crops.append(image)
+        return crops
+   
+    
+    @torch.no_grad()
+    def forward_images(self, image:Image) -> torch.Tensor:
+        crops = self.crop_image(image, self.n_crops)
+        crops = [self.preprocess(crop) for crop in crops]
+        crops = torch.stack(crops).to(self.device)  # [self.n_crops+1, 3, H, W]
+        image_features = self.clip.encode_image(crops)
+        return image_features
+        
 
 class ClipHuggingFaceRetrival(TextImageRetrieval):
     def __init__(self, model_name:str="openai/clip-vit-large-patch14", device:str="cuda", batch_size:int=128, prompt:str="", truncate_dim=None):

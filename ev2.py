@@ -1,16 +1,15 @@
-from models.retrivals import OpenCLIPRetrival, InvAttenRetrival, ClipHuggingFaceRetrival
-from torchvision.datasets import CocoCaptions
+from typing import Any
+from models.retrivals import ClipHuggingFaceRetrival, JinaRetrival, InvAttenRetrival, OpenCLIPRetrival, GridCroppingRetrival
 import pandas as pd 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 import os
 import json
 from datasets import load_dataset
-import requests
 from PIL import Image
-from io import BytesIO
 from tqdm import tqdm
 
+#Global 
+NEED_NORMALIZATION = True
 
 class Kerpaty_cococ: 
     def __init__(self, images_path: str, single_caption: bool = True):
@@ -29,7 +28,7 @@ class Kerpaty_cococ:
         captions = self.dataset[idx]['sentences']
         
         # Handle the caption structure properly
-        if self.single_caption:
+        if self.single_caption: #this is used for Text-to-Image retrieval evaluation 
             captions = [captions[0]]
             
         return image, captions
@@ -50,14 +49,12 @@ def compute_similarity_max_crop(images_df, texts_df):
                  One row per text
     
     Returns:
-        i2t_similarity: [n_unique_images, n_texts] matrix for image-to-text
         t2i_similarity: [n_texts, n_unique_images] matrix for text-to-image
     """
     print("Computing max-crop similarities...")
     
     # Get unique image data indices (original images)
     unique_image_indices = sorted(images_df['data_index'].unique())
-    unique_text_indices = sorted(texts_df['data_index'].unique())
     
     n_unique_images = len(unique_image_indices)
     n_texts = len(texts_df)
@@ -66,7 +63,8 @@ def compute_similarity_max_crop(images_df, texts_df):
     
     # Get text embeddings and normalize
     text_embeddings = np.stack(texts_df['embedding'].values)
-    text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+    if NEED_NORMALIZATION:
+        text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
     
     # Initialize similarity matrices
     t2i_similarity = np.zeros((n_texts, n_unique_images))  # [n_texts, n_unique_images]
@@ -81,9 +79,6 @@ def compute_similarity_max_crop(images_df, texts_df):
         crop_embeddings = crop_embeddings / np.linalg.norm(crop_embeddings, axis=1, keepdims=True)
         
         # Compute similarity between all texts and all crops of this image
-        # text_embeddings: [n_texts, embed_dim]
-        # crop_embeddings: [n_crops, embed_dim]
-        # similarities: [n_texts, n_crops]
         similarities = np.dot(text_embeddings, crop_embeddings.T)
         
         # Take maximum similarity across crops for each text
@@ -91,14 +86,9 @@ def compute_similarity_max_crop(images_df, texts_df):
         
         # Store in t2i matrix
         t2i_similarity[:, img_idx] = max_similarities
+    print(f"Final similarity matrices: T2I {t2i_similarity.shape}")
     
-    # For i2t, we need to transpose the relationship
-    # i2t_similarity[i, j] = similarity between image i and text j
-    i2t_similarity = t2i_similarity.T  # [n_unique_images, n_texts]
-    
-    print(f"Final similarity matrices: I2T {i2t_similarity.shape}, T2I {t2i_similarity.shape}")
-    
-    return i2t_similarity, t2i_similarity
+    return t2i_similarity
 
 
 def compute_retrieval_standard(a2b_sims, return_ranks=True):
@@ -142,7 +132,7 @@ def compute_retrieval_standard(a2b_sims, return_ranks=True):
         return report_dict
 
 
-def recall_standard(retrival, save_path: str = None, single_caption: bool = True) -> tuple:
+def text2image_recall(retrival, save_path: str = None, single_caption: bool = True) -> dict[str, Any] | str:
     """
     Standard CLIP evaluation that matches published results.
     Handles both regular retrievals and InvAttenRetrival (with max similarity across crops).
@@ -154,19 +144,14 @@ def recall_standard(retrival, save_path: str = None, single_caption: bool = True
     retrival.index_coco_dataset(dataset)
     images = pd.DataFrame(retrival.images)
     texts = pd.DataFrame(retrival.texts)  
-    
-    print(f"Raw dataset size: {len(images)} image embeddings, {len(texts)} texts")
-    
-    # Check if this is InvAttenRetrival (multiple embeddings per image)
     is_multi_crop = len(images) != len(texts)
     
     if is_multi_crop:
-        print("Detected multi-crop retrieval (InvAttenRetrival)")
-        i2t_similarity, t2i_similarity = compute_similarity_max_crop(images, texts)
-        print(f"Aggregated to: {i2t_similarity.shape[0]} images, {t2i_similarity.shape[0]} texts")
+        print("Detected multi-crop retrieval")
+        t2i_similarity = compute_similarity_max_crop(images, texts)
+        print(f"Aggregated to: {t2i_similarity.shape[0]} images, {t2i_similarity.shape[0]} texts")
     else:
         print("Standard single-embedding retrieval")
-        # Get embeddings
         image_embeddings = np.stack(images['embedding'].values)
         text_embeddings = np.stack(texts['embedding'].values)
         
@@ -175,12 +160,7 @@ def recall_standard(retrival, save_path: str = None, single_caption: bool = True
         text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
         
         # Compute similarity matrices
-        i2t_similarity = np.dot(image_embeddings, text_embeddings.T)  # Image to Text
-        t2i_similarity = np.dot(text_embeddings, image_embeddings.T)  # Text to Image
-    
-    print("Computing Image-to-Text retrieval...")
-    i2t_results, _ = compute_retrieval_standard(i2t_similarity)
-    print(f"I2T Results: R@1: {i2t_results['r1']:.2f}%, R@5: {i2t_results['r5']:.2f}%, R@10: {i2t_results['r10']:.2f}%")
+        t2i_similarity = np.dot(image_embeddings, text_embeddings.T)  # Text to Image
     
     print("Computing Text-to-Image retrieval...")
     t2i_results, _ = compute_retrieval_standard(t2i_similarity)
@@ -194,7 +174,6 @@ def recall_standard(retrival, save_path: str = None, single_caption: bool = True
         images_for_saving = images_for_saving.drop('image', axis=1)
         
         # Save embeddings and metadata
-        np.save(os.path.join(save_path, "i2t_similarity.npy"), i2t_similarity)
         np.save(os.path.join(save_path, "t2i_similarity.npy"), t2i_similarity)
         
         images_for_saving.to_parquet(os.path.join(save_path, "images_metadata.parquet"), index=False)
@@ -202,10 +181,9 @@ def recall_standard(retrival, save_path: str = None, single_caption: bool = True
         
         # Save results
         combined_results = {
-            "image_to_text_recall": i2t_results,
             "text_to_image_recall": t2i_results,
             "dataset_stats": {
-                "n_unique_images": i2t_similarity.shape[0],
+                "n_unique_images": t2i_similarity.shape[0],
                 "n_texts": len(texts),
                 "single_caption": single_caption,
                 "is_multi_crop": is_multi_crop
@@ -218,139 +196,104 @@ def recall_standard(retrival, save_path: str = None, single_caption: bool = True
         
         print(f"Results saved to: {save_path}")
     
-    return i2t_results, t2i_results
-    
-    # Save results if save_path is provided
-    if save_path is not None:
-        os.makedirs(save_path, exist_ok=True)
-        
-        images_for_saving = images.copy()
-        images_for_saving = images_for_saving.drop('image', axis=1)
-        
-        # Save embeddings and metadata
-        np.save(os.path.join(save_path, "image_embeddings.npy"), image_embeddings)
-        np.save(os.path.join(save_path, "text_embeddings.npy"), text_embeddings)
-        np.save(os.path.join(save_path, "i2t_similarity.npy"), i2t_similarity)
-        np.save(os.path.join(save_path, "t2i_similarity.npy"), t2i_similarity)
-        
-        images_for_saving.to_parquet(os.path.join(save_path, "images_metadata.parquet"), index=False)
-        texts.to_parquet(os.path.join(save_path, "texts_metadata.parquet"), index=False)
-        
-        # Save results
-        combined_results = {
-            "image_to_text_recall": i2t_results,
-            "text_to_image_recall": t2i_results,
-            "dataset_stats": {
-                "n_images": len(images),
-                "n_texts": len(texts),
-                "single_caption": single_caption
-            },
-            "evaluation_type": "standard_clip"
-        }
-        
-        with open(os.path.join(save_path, "standard_clip_results.json"), 'w') as f:
-            json.dump(combined_results, f, indent=2)
-        
-        print(f"Results saved to: {save_path}")
-    
-    return i2t_results, t2i_results
+    return t2i_results
 
 
-def similarity_calculation(text_embeddings, image_embeddings):
-    """
-    Calculate similarity matrix using normalized dot products.
+# def similarity_calculation(text_embeddings, image_embeddings):
+#     """
+#     Calculate similarity matrix using normalized dot products.
     
-    Args:
-        text_embeddings: numpy array of shape [n_texts, embed_dim]
-        image_embeddings: numpy array of shape [n_images, embed_dim] 
+#     Args:
+#         text_embeddings: numpy array of shape [n_texts, embed_dim]
+#         image_embeddings: numpy array of shape [n_images, embed_dim] 
         
-    Returns:
-        similarity_matrix: numpy array of shape [n_texts, n_images]
-    """
-    # Normalize embeddings to unit vectors (L2 normalization)
-    text_embeddings_norm = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
-    image_embeddings_norm = image_embeddings / np.linalg.norm(image_embeddings, axis=1, keepdims=True)
+#     Returns:
+#         similarity_matrix: numpy array of shape [n_texts, n_images]
+#     """
+#     # Normalize embeddings to unit vectors (L2 normalization)
+#     text_embeddings_norm = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+#     image_embeddings_norm = image_embeddings / np.linalg.norm(image_embeddings, axis=1, keepdims=True)
     
-    # Compute similarity using dot product (equivalent to cosine similarity when normalized)
-    similarity_matrix = np.dot(text_embeddings_norm, image_embeddings_norm.T)
+#     # Compute similarity using dot product (equivalent to cosine similarity when normalized)
+#     similarity_matrix = np.dot(text_embeddings_norm, image_embeddings_norm.T)
     
-    return similarity_matrix
+#     return similarity_matrix
 
 
-def recall_original(retrival: OpenCLIPRetrival, save_path: str = None) -> tuple:
-    """Your original evaluation approach for comparison"""
-    dataset = Kerpaty_cococ(images_path="coco_test_images", single_caption=False) 
-    retrival.index_coco_dataset(dataset)
-    images = pd.DataFrame(retrival.images)
-    texts = pd.DataFrame(retrival.texts)  
+# def recall_original(retrival: OpenCLIPRetrival, save_path: str = None) -> tuple:
+#     """Your original evaluation approach for comparison"""
+#     dataset = Kerpaty_cococ(images_path="coco_test_images", single_caption=False) 
+#     retrival.index_coco_dataset(dataset)
+#     images = pd.DataFrame(retrival.images)
+#     texts = pd.DataFrame(retrival.texts)  
     
-    image_embeddings = np.stack(images['embedding'].values)
-    text_embeddings = np.stack(texts['embedding'].values)
+#     image_embeddings = np.stack(images['embedding'].values)
+#     text_embeddings = np.stack(texts['embedding'].values)
 
-    # Replace cosine_similarity with custom dot product function
-    similarity_matrix = similarity_calculation(text_embeddings, image_embeddings)
+#     # Replace cosine_similarity with custom dot product function
+#     similarity_matrix = similarity_calculation(text_embeddings, image_embeddings)
 
-    n_texts, n_images = len(texts), len(images)
-    text_indices = np.repeat(np.arange(n_texts), n_images)
-    image_indices = np.tile(np.arange(n_images), n_texts)
-    text_data_indices = texts['data_index'].iloc[text_indices].values
-    image_data_indices = images['data_index'].iloc[image_indices].values
+#     n_texts, n_images = len(texts), len(images)
+#     text_indices = np.repeat(np.arange(n_texts), n_images)
+#     image_indices = np.tile(np.arange(n_images), n_texts)
+#     text_data_indices = texts['data_index'].iloc[text_indices].values
+#     image_data_indices = images['data_index'].iloc[image_indices].values
 
-    similarity_df = pd.DataFrame({
-        'text_data_index': text_data_indices,
-        'image_data_index': image_data_indices,
-        'text_idx': text_indices,
-        'image_idx': image_indices,
-        'cosine_similarity': similarity_matrix.flatten(),
-        'is_correct_pair': text_data_indices == image_data_indices
-    })
+#     similarity_df = pd.DataFrame({
+#         'text_data_index': text_data_indices,
+#         'image_data_index': image_data_indices,
+#         'text_idx': text_indices,
+#         'image_idx': image_indices,
+#         'cosine_similarity': similarity_matrix.flatten(),
+#         'is_correct_pair': text_data_indices == image_data_indices
+#     })
     
-    recall_results = calculate_recall_at_k_from_table(similarity_df, k_vals=[1, 5, 10])
-    i2t_recall_results = calculate_image_to_text_recall_at_k(similarity_df, k_vals=[1, 5, 10])
+#     recall_results = calculate_recall_at_k_from_table(similarity_df, k_vals=[1, 5, 10])
+#     i2t_recall_results = calculate_image_to_text_recall_at_k(similarity_df, k_vals=[1, 5, 10])
     
-    return similarity_df, recall_results, i2t_recall_results
+#     return similarity_df, recall_results, i2t_recall_results
 
 
-def calculate_recall_at_k_from_table(similarity_df, k_vals):
-    """Calculate text-to-image recall@k from similarity table"""
-    results = {}
-    grouped = similarity_df.groupby('text_idx')
+# def calculate_recall_at_k_from_table(similarity_df, k_vals):
+#     """Calculate text-to-image recall@k from similarity table"""
+#     results = {}
+#     grouped = similarity_df.groupby('text_idx')
     
-    for k in k_vals:
-        correct_retrievals = 0
-        total_texts = len(grouped)
+#     for k in k_vals:
+#         correct_retrievals = 0
+#         total_texts = len(grouped)
         
-        for text_idx, group in grouped:
-            top_k = group.nlargest(k, 'cosine_similarity')
-            if top_k['is_correct_pair'].any():
-                correct_retrievals += 1
+#         for text_idx, group in grouped:
+#             top_k = group.nlargest(k, 'cosine_similarity')
+#             if top_k['is_correct_pair'].any():
+#                 correct_retrievals += 1
         
-        recall_at_k = correct_retrievals / total_texts
-        results[f'R@{k}'] = recall_at_k
-        print(f"Text-to-Image R@{k}: {100*recall_at_k:.2f}%")
+#         recall_at_k = correct_retrievals / total_texts
+#         results[f'R@{k}'] = recall_at_k
+#         print(f"Text-to-Image R@{k}: {100*recall_at_k:.2f}%")
     
-    return results
+#     return results
 
 
-def calculate_image_to_text_recall_at_k(similarity_df, k_vals):
-    """Calculate image-to-text recall@k from similarity table"""
-    results = {}
-    grouped = similarity_df.groupby('image_idx')
+# def calculate_image_to_text_recall_at_k(similarity_df, k_vals):
+#     """Calculate image-to-text recall@k from similarity table"""
+#     results = {}
+#     grouped = similarity_df.groupby('image_idx')
     
-    for k in k_vals:
-        correct_retrievals = 0
-        total_images = len(grouped)
+#     for k in k_vals:
+#         correct_retrievals = 0
+#         total_images = len(grouped)
         
-        for image_idx, group in grouped:
-            top_k = group.nlargest(k, 'cosine_similarity')
-            if top_k['is_correct_pair'].any():
-                correct_retrievals += 1
+#         for image_idx, group in grouped:
+#             top_k = group.nlargest(k, 'cosine_similarity')
+#             if top_k['is_correct_pair'].any():
+#                 correct_retrievals += 1
         
-        recall_at_k = correct_retrievals / total_images
-        results[f'I2T_R@{k}'] = recall_at_k
-        print(f"Image-to-Text R@{k}: {100*recall_at_k:.2f}%")
+#         recall_at_k = correct_retrievals / total_images
+#         results[f'I2T_R@{k}'] = recall_at_k
+#         print(f"Image-to-Text R@{k}: {100*recall_at_k:.2f}%")
     
-    return results
+#     return results
 
 
 if __name__ == "__main__":
@@ -360,37 +303,46 @@ if __name__ == "__main__":
     
     # Test different retrieval methods
     methods_to_test = [
-        {
-            "name": "CLIP HuggingFace",
-            "retrieval": ClipHuggingFaceRetrival(
-                model_name="openai/clip-vit-large-patch14",
-                device="cuda:2",
-                batch_size=128,
-                prompt=""  # No prompt for standard evaluation
-            ),
-            "save_path": "CLIP_huggingface_standard"
-        },
-        # Uncomment to test other methods:
-        # {
-        #     "name": "OpenCLIP",
-        #     "retrieval": OpenCLIPRetrival(
-        #         model_name="ViT-L-14-336",
-        #         dataset="openai",
-        #         device="cuda",
-        #         batch_size=128,
-        #         prompt=""
-        #     ),
-        #     "save_path": "OpenCLIP_standard"
-        # },
-        # {
-        #     "name": "InvAttenRetrival",
-        #     "retrieval": InvAttenRetrival(
-        #         device="cuda",
-        #         n_crops=5,
-        #         include_full_image=True
-        #     ),
-        #     "save_path": "InvAtten_standard"
-        # }
+    #     {
+    #         "name": "CLIP",
+    #         "retrieval": ClipHuggingFaceRetrival(
+    #             model_name="openai/clip-vit-large-patch14",
+    #             device="cuda:2",
+    #             batch_size=128,
+    #             prompt=""
+    #         ),
+    #         "save_path": "CLIP_huggingface"
+    #     },
+    #    {
+    #        "name": "Jina CLIP v2",
+    #        "retrieval": JinaRetrival(
+    #            device="cuda:2",
+    #            batch_size=128,
+    #            prompt=""
+    #        ),
+    #        "save_path": "Jina"
+    #    },
+    #    {
+    #        "name": "SigLIP",
+    #        "retrieval": OpenCLIPRetrival(
+    #             model_name="ViT-SO400M-14-SigLIP-384",
+    #             dataset="webli",
+    #             device="cuda:3",
+    #             batch_size=128,
+    #             prompt=""
+    #         ),
+    #         "save_path": "SigLIP"
+    #    }, 
+    #    {
+    #        "name": "InvAtten",
+    #        "retrieval": InvAttenRetrival(device="cuda:0"),
+    #        "save_path": "InvAtten__"
+    #    }, 
+       {
+        "name": "Grid Cropping", 
+         "retrieval": GridCroppingRetrival(device="cuda:3", n_crops=5),
+           "save_path": "Grid"  
+       }
     ]
     
     all_results = {}
@@ -401,14 +353,13 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         
         try:
-            i2t_results, t2i_results = recall_standard(
+            t2i_results = text2image_recall(
                 method_config["retrieval"], 
                 save_path=method_config["save_path"], 
                 single_caption=True
             )
             
             all_results[method_config['name']] = {
-                'i2t': i2t_results,
                 't2i': t2i_results
             }
             
@@ -421,16 +372,12 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print("COMPARISON SUMMARY")
         print("=" * 80)
-        print(f"{'Method':<20} {'I2T R@1':<10} {'I2T R@5':<10} {'I2T R@10':<10} {'T2I R@1':<10} {'T2I R@5':<10} {'T2I R@10':<10}")
+        print(f"{'Method':<20} {'T2I R@1':<10} {'T2I R@5':<10} {'T2I R@10':<10}")
         print("-" * 80)
         
         for method_name, results in all_results.items():
-            i2t = results['i2t']
             t2i = results['t2i']
             print(f"{method_name:<20} "
-                  f"{i2t['r1']:<10.2f} "
-                  f"{i2t['r5']:<10.2f} "
-                  f"{i2t['r10']:<10.2f} "
                   f"{t2i['r1']:<10.2f} "
                   f"{t2i['r5']:<10.2f} "
                   f"{t2i['r10']:<10.2f}")
@@ -438,17 +385,3 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("COMPARISON WITH ORIGINAL EVALUATION (Optional)")
     print("=" * 50)
-    print("Uncomment the code below to compare with your original multi-caption approach")
-    
-    # Uncomment to compare with original approach:
-    print("Running original evaluation for comparison...")
-    retrival = ClipHuggingFaceRetrival(
-        model_name="openai/clip-vit-large-patch14",
-        device="cuda", 
-        batch_size=128,
-        prompt=""
-    )
-    similarity_df, recall_results, i2t_recall_results = recall_original(
-        retrival, 
-        save_path="CLIP_original_results"
-    )
