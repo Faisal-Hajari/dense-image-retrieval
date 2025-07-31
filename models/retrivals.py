@@ -93,7 +93,7 @@ class InvAttenRetrival(TextImageRetrieval):
         self.threshold = threshold 
         self.stride = stride
         self.tokenizer = open_clip.get_tokenizer("ViT-SO400M-14-SigLIP-384")
-        self.batch_size = 512
+        self.batch_size = 1
         self.images = {"data_index":[], "image":[], "embedding":[]}
         self.texts = {"data_index":[], "text":[], "embedding":[]}
         
@@ -299,6 +299,8 @@ class GridCroppingRetrival(TextImageRetrieval):
         self.images = {"data_index":[], "image":[], "embedding":[]}
         self.texts = {"data_index":[], "text":[], "embedding":[]} 
         self.n_crops = n_crops
+        self.batch_size = 1
+        self.tokenizer = open_clip.get_tokenizer("ViT-SO400M-14-SigLIP-384")
         
     def index_coco_dataset(self, coco_dataset: CocoCaptions) -> None:
         # embedding_per_image = self.n_crops + 1 if self.include_full_image else self.n_crops

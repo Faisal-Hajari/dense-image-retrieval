@@ -303,41 +303,41 @@ if __name__ == "__main__":
     
     # Test different retrieval methods
     methods_to_test = [
-    #     {
-    #         "name": "CLIP",
-    #         "retrieval": ClipHuggingFaceRetrival(
-    #             model_name="openai/clip-vit-large-patch14",
-    #             device="cuda:2",
-    #             batch_size=128,
-    #             prompt=""
-    #         ),
-    #         "save_path": "CLIP_huggingface"
-    #     },
-    #    {
-    #        "name": "Jina CLIP v2",
-    #        "retrieval": JinaRetrival(
-    #            device="cuda:2",
-    #            batch_size=128,
-    #            prompt=""
-    #        ),
-    #        "save_path": "Jina"
-    #    },
-    #    {
-    #        "name": "SigLIP",
-    #        "retrieval": OpenCLIPRetrival(
-    #             model_name="ViT-SO400M-14-SigLIP-384",
-    #             dataset="webli",
-    #             device="cuda:3",
-    #             batch_size=128,
-    #             prompt=""
-    #         ),
-    #         "save_path": "SigLIP"
-    #    }, 
-    #    {
-    #        "name": "InvAtten",
-    #        "retrieval": InvAttenRetrival(device="cuda:0"),
-    #        "save_path": "InvAtten__"
-    #    }, 
+        {
+            "name": "CLIP",
+            "retrieval": ClipHuggingFaceRetrival(
+                model_name="openai/clip-vit-large-patch14",
+                device="cuda:2",
+                batch_size=128,
+                prompt=""
+            ),
+            "save_path": "CLIP_huggingface"
+        },
+       {
+           "name": "Jina CLIP v2",
+           "retrieval": JinaRetrival(
+               device="cuda:2",
+               batch_size=128,
+               prompt=""
+           ),
+           "save_path": "Jina"
+       },
+       {
+           "name": "SigLIP",
+           "retrieval": OpenCLIPRetrival(
+                model_name="ViT-SO400M-14-SigLIP-384",
+                dataset="webli",
+                device="cuda:3",
+                batch_size=128,
+                prompt=""
+            ),
+            "save_path": "SigLIP"
+       }, 
+       {
+           "name": "InvAtten",
+           "retrieval": InvAttenRetrival(device="cuda:0"),
+           "save_path": "InvAtten__"
+       }, 
        {
         "name": "Grid Cropping", 
          "retrieval": GridCroppingRetrival(device="cuda:3", n_crops=5),
